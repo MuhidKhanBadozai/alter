@@ -115,7 +115,11 @@ export default function Dashboard({ user, audioSettings, onOpenSettings }: Dashb
     }
   }, []);
 
-  const rtc = useWebRTC(callCode, user.username, handleAppData);
+  const rtc = useWebRTC(callCode, user.username, handleAppData, {
+    inputDeviceId: audioSettings.inputDeviceId,
+    noiseCancellation: audioSettings.noiseCancellation,
+    echoCancellation: audioSettings.echoCancellation,
+  });
   const isMuted = rtc.isMuted;
   const callPhase = rtc.status === 'idle' || rtc.status === 'ended'
     ? CallPhase.IDLE

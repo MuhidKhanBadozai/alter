@@ -27,7 +27,44 @@ const ICE_SERVERS = {
   ]
 };
 
-export function useWebRTC(roomCode: string, username: string, onAppData?: (from: string, data: string) => void) {
+interface AudioConstraints {
+  inputDeviceId?: string;
+  noiseCancellation?: boolean;
+  echoCancellation?: boolean;
+}
+
+/**
+ * Patches WebRTC SDP to enable Opus DTX (silence suppression) and in-band FEC
+ * (forward error correction) — reduces bandwidth noise and improves audio quality.
+ */
+function patchOpusSdp(sdp: string): string {
+  // Find opus payload type
+  const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/);
+  if (!opusMatch) return sdp;
+  const pt = opusMatch[1];
+  // Replace or append fmtp line for this payload type
+  const fmtpRegex = new RegExp(`(a=fmtp:${pt} )(.*)`);
+  if (fmtpRegex.test(sdp)) {
+    return sdp.replace(fmtpRegex, (_m, prefix, params) => {
+      const parts = params.split(';').map((p: string) => p.trim()).filter(Boolean);
+      const set = new Map(parts.map((p: string) => { const [k, v] = p.split('='); return [k.trim(), v?.trim() ?? '1']; }));
+      set.set('usedtx', '1');       // DTX: stop sending during silence
+      set.set('useinbandfec', '1'); // FEC: recover from packet loss
+      set.set('minptime', '10');    // 10ms packetization — low latency
+      set.set('maxplaybackrate', '48000'); // Full 48kHz fidelity
+      set.set('stereo', '0');       // Mono voice (bandwidth efficient)
+      return prefix + Array.from(set.entries()).map(([k, v]) => `${k}=${v}`).join(';');
+    });
+  } else {
+    // No fmtp line exists, insert one
+    return sdp.replace(
+      new RegExp(`(a=rtpmap:${pt} opus\/48000\/2)`),
+      `$1\r\na=fmtp:${pt} usedtx=1;useinbandfec=1;minptime=10;maxplaybackrate=48000;stereo=0`
+    );
+  }
+}
+
+export function useWebRTC(roomCode: string, username: string, onAppData?: (from: string, data: string) => void, audioConstraints?: AudioConstraints) {
   const [state, setState] = useState<WebRTCState>({
     status: 'idle',
     localAudioStream: null,
@@ -174,17 +211,23 @@ export function useWebRTC(roomCode: string, username: string, onAppData?: (from:
     return pc;
   }, [broadcast, updateRemotePeer, removeRemotePeer]);
 
-  // ─── Microphone access ────────────────────────────────────────────────────
+  // ─── Microphone access (uses audioConstraints for device + noise settings) ─
   const getMicrophone = useCallback(async (): Promise<MediaStream | null> => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          noiseSuppression: true,
-          echoCancellation: true,
-          autoGainControl: true,
-        },
-        video: false,
-      });
+      const noiseCancel = audioConstraints?.noiseCancellation !== false;
+      const echoCancel = audioConstraints?.echoCancellation !== false;
+      const deviceId = audioConstraints?.inputDeviceId;
+
+      const audioConfig: MediaTrackConstraints = {
+        noiseSuppression: noiseCancel,
+        echoCancellation: echoCancel,
+        autoGainControl: true,
+        sampleRate: 48000,
+        channelCount: 1,
+        ...(deviceId && deviceId !== 'default' ? { deviceId: { exact: deviceId } } : {}),
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConfig, video: false });
       localAudioStreamRef.current = stream;
       setState(s => ({ ...s, localAudioStream: stream, error: null }));
       return stream;
@@ -192,7 +235,7 @@ export function useWebRTC(roomCode: string, username: string, onAppData?: (from:
       setState(s => ({ ...s, error: 'Could not access microphone.' }));
       return null;
     }
-  }, []);
+  }, [audioConstraints]);
 
   // ─── Toggle mute ──────────────────────────────────────────────────────────
   const toggleMute = useCallback(() => {
@@ -297,8 +340,10 @@ export function useWebRTC(roomCode: string, username: string, onAppData?: (from:
       const pc = pcs.current.get(joinerName) ?? createPeerConnection(joinerName);
       try {
         const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        broadcast('webrtc_offer', { from: usernameRef.current, to: joinerName, sdp: offer });
+        // Patch SDP to enable Opus DTX + FEC for lower noise floor
+        const patchedOffer = { ...offer, sdp: patchOpusSdp(offer.sdp || '') };
+        await pc.setLocalDescription(patchedOffer);
+        broadcast('webrtc_offer', { from: usernameRef.current, to: joinerName, sdp: patchedOffer });
       } catch (e) { console.error('Offer error:', e); }
     });
 
@@ -318,8 +363,10 @@ export function useWebRTC(roomCode: string, username: string, onAppData?: (from:
         await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
         await drainQueue(offererName);
         const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        broadcast('webrtc_answer', { from: usernameRef.current, to: offererName, sdp: answer });
+        // Patch SDP to enable Opus DTX + FEC for lower noise floor
+        const patchedAnswer = { ...answer, sdp: patchOpusSdp(answer.sdp || '') };
+        await pc.setLocalDescription(patchedAnswer);
+        broadcast('webrtc_answer', { from: usernameRef.current, to: offererName, sdp: patchedAnswer });
       } catch (e) { console.error('Offer handling error:', e); }
     });
 
