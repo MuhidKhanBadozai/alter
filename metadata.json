@@ -1,0 +1,6 @@
+{
+  "name": "Call Code Voice App",
+  "description": "An Electron-styled voice calling application. Users register an account locally, create or join rooms using unique call codes, adjust audio/settings, and see real-time active speakers.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
