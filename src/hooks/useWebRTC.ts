@@ -33,37 +33,6 @@ interface AudioConstraints {
   echoCancellation?: boolean;
 }
 
-/**
- * Patches WebRTC SDP to enable Opus DTX (silence suppression) and in-band FEC
- * (forward error correction) — reduces bandwidth noise and improves audio quality.
- */
-function patchOpusSdp(sdp: string): string {
-  // Find opus payload type
-  const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/);
-  if (!opusMatch) return sdp;
-  const pt = opusMatch[1];
-  // Replace or append fmtp line for this payload type
-  const fmtpRegex = new RegExp(`(a=fmtp:${pt} )(.*)`);
-  if (fmtpRegex.test(sdp)) {
-    return sdp.replace(fmtpRegex, (_m, prefix, params) => {
-      const parts = params.split(';').map((p: string) => p.trim()).filter(Boolean);
-      const set = new Map(parts.map((p: string) => { const [k, v] = p.split('='); return [k.trim(), v?.trim() ?? '1']; }));
-      set.set('usedtx', '1');       // DTX: stop sending during silence
-      set.set('useinbandfec', '1'); // FEC: recover from packet loss
-      set.set('minptime', '10');    // 10ms packetization — low latency
-      set.set('maxplaybackrate', '48000'); // Full 48kHz fidelity
-      set.set('stereo', '0');       // Mono voice (bandwidth efficient)
-      return prefix + Array.from(set.entries()).map(([k, v]) => `${k}=${v}`).join(';');
-    });
-  } else {
-    // No fmtp line exists, insert one
-    return sdp.replace(
-      new RegExp(`(a=rtpmap:${pt} opus\/48000\/2)`),
-      `$1\r\na=fmtp:${pt} usedtx=1;useinbandfec=1;minptime=10;maxplaybackrate=48000;stereo=0`
-    );
-  }
-}
-
 export function useWebRTC(roomCode: string, username: string, onAppData?: (from: string, data: string) => void, audioConstraints?: AudioConstraints) {
   const [state, setState] = useState<WebRTCState>({
     status: 'idle',
@@ -85,6 +54,8 @@ export function useWebRTC(roomCode: string, username: string, onAppData?: (from:
   const injectedAudioRef = useRef<MediaStreamTrack | null>(null);
   const usernameRef = useRef(username);
   usernameRef.current = username;
+  const roomCodeRef = useRef(roomCode);
+  roomCodeRef.current = roomCode;
 
   // ─── Utility: update or add a remote peer in state ────────────────────────
   const updateRemotePeer = useCallback((peerUsername: string, updates: Partial<RemotePeer>) => {
@@ -199,51 +170,92 @@ export function useWebRTC(roomCode: string, username: string, onAppData?: (from:
       }
     };
 
-    // Connection state changes
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') {
+    // Connection state changes (listen to both connectionState & iceConnectionState)
+    const checkConnectionState = () => {
+      const isConnected =
+        pc.connectionState === 'connected' ||
+        pc.iceConnectionState === 'connected' ||
+        pc.iceConnectionState === 'completed';
+
+      if (isConnected) {
         setState(s => ({ ...s, status: 'connected' }));
-      } else if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
+      } else if (
+        ['disconnected', 'failed', 'closed'].includes(pc.connectionState) &&
+        ['disconnected', 'failed', 'closed'].includes(pc.iceConnectionState)
+      ) {
         removeRemotePeer(peerUsername);
       }
     };
 
+    pc.onconnectionstatechange = checkConnectionState;
+    pc.oniceconnectionstatechange = checkConnectionState;
+
     return pc;
   }, [broadcast, updateRemotePeer, removeRemotePeer]);
 
-  // ─── Microphone access (uses audioConstraints for device + noise settings) ─
+  // ─── Microphone access (uses audioConstraints with resilient fallback) ─
   const getMicrophone = useCallback(async (): Promise<MediaStream | null> => {
     try {
       const noiseCancel = audioConstraints?.noiseCancellation !== false;
       const echoCancel = audioConstraints?.echoCancellation !== false;
       const deviceId = audioConstraints?.inputDeviceId;
 
+      // Only specify deviceId if it's a real hardware device ID, never mock/fallback names
+      const isRealDeviceId = Boolean(
+        deviceId &&
+        deviceId !== 'default' &&
+        deviceId !== 'default-mic' &&
+        !deviceId.startsWith('input-')
+      );
+
       const audioConfig: MediaTrackConstraints = {
         noiseSuppression: noiseCancel,
         echoCancellation: echoCancel,
         autoGainControl: true,
-        sampleRate: 48000,
-        channelCount: 1,
-        ...(deviceId && deviceId !== 'default' ? { deviceId: { exact: deviceId } } : {}),
+        ...(isRealDeviceId ? { deviceId: { ideal: deviceId } } : {}),
       };
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConfig, video: false });
       localAudioStreamRef.current = stream;
-      setState(s => ({ ...s, localAudioStream: stream, error: null }));
+      localAudioStreamRef.current = stream;
+      setState(s => {
+        if (s.isMuted) {
+          stream.getAudioTracks().forEach(t => { t.enabled = false; });
+        }
+        return { ...s, localAudioStream: stream, error: null };
+      });
       return stream;
-    } catch {
-      setState(s => ({ ...s, error: 'Could not access microphone.' }));
-      return null;
+    } catch (err) {
+      console.warn('[WebRTC] Advanced mic constraints failed, trying basic audio...', err);
+      try {
+        // Fallback to basic audio so the user is never blocked
+        const fallbackStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        localAudioStreamRef.current = fallbackStream;
+        setState(s => {
+          if (s.isMuted) {
+            fallbackStream.getAudioTracks().forEach(t => { t.enabled = false; });
+          }
+          return { ...s, localAudioStream: fallbackStream, error: null };
+        });
+        return fallbackStream;
+      } catch (fallbackErr) {
+        console.error('[WebRTC] Could not access microphone:', fallbackErr);
+        setState(s => ({ ...s, error: 'Could not access microphone.' }));
+        return null;
+      }
     }
   }, [audioConstraints]);
 
   // ─── Toggle mute ──────────────────────────────────────────────────────────
   const toggleMute = useCallback(() => {
-    const stream = localAudioStreamRef.current;
-    if (!stream) return;
     setState(s => {
       const newMuted = !s.isMuted;
-      stream.getAudioTracks().forEach(t => { t.enabled = !newMuted; });
+      const stream = localAudioStreamRef.current;
+      if (stream) {
+        stream.getAudioTracks().forEach(t => {
+          t.enabled = !newMuted;
+        });
+      }
       return { ...s, isMuted: newMuted };
     });
   }, []);
@@ -319,11 +331,13 @@ export function useWebRTC(roomCode: string, username: string, onAppData?: (from:
   }, [broadcast]);
 
   // ─── Initialize Supabase Realtime signaling channel ───────────────────────
-  const initSignaling = useCallback(() => {
-    if (!roomCode) return;
+  // Accepts roomCode as a parameter so it always uses the live value,
+  // never a stale closure captured during useCallback memoization.
+  const initSignaling = useCallback((activeRoomCode: string) => {
+    if (!activeRoomCode) return;
     if (channelRef.current) supabase.removeChannel(channelRef.current);
 
-    const chan = supabase.channel(`call-${roomCode}`, {
+    const chan = supabase.channel(`call-${activeRoomCode}`, {
       config: { broadcast: { self: false } },
     });
     channelRef.current = chan;
@@ -340,10 +354,8 @@ export function useWebRTC(roomCode: string, username: string, onAppData?: (from:
       const pc = pcs.current.get(joinerName) ?? createPeerConnection(joinerName);
       try {
         const offer = await pc.createOffer();
-        // Patch SDP to enable Opus DTX + FEC for lower noise floor
-        const patchedOffer = { ...offer, sdp: patchOpusSdp(offer.sdp || '') };
-        await pc.setLocalDescription(patchedOffer);
-        broadcast('webrtc_offer', { from: usernameRef.current, to: joinerName, sdp: patchedOffer });
+        await pc.setLocalDescription(offer);
+        broadcast('webrtc_offer', { from: usernameRef.current, to: joinerName, sdp: offer });
       } catch (e) { console.error('Offer error:', e); }
     });
 
@@ -363,10 +375,8 @@ export function useWebRTC(roomCode: string, username: string, onAppData?: (from:
         await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
         await drainQueue(offererName);
         const answer = await pc.createAnswer();
-        // Patch SDP to enable Opus DTX + FEC for lower noise floor
-        const patchedAnswer = { ...answer, sdp: patchOpusSdp(answer.sdp || '') };
-        await pc.setLocalDescription(patchedAnswer);
-        broadcast('webrtc_answer', { from: usernameRef.current, to: offererName, sdp: patchedAnswer });
+        await pc.setLocalDescription(answer);
+        broadcast('webrtc_answer', { from: usernameRef.current, to: offererName, sdp: answer });
       } catch (e) { console.error('Offer handling error:', e); }
     });
 
@@ -425,13 +435,16 @@ export function useWebRTC(roomCode: string, username: string, onAppData?: (from:
         broadcast('user_joined', { username: usernameRef.current });
       }
     });
-  }, [roomCode, broadcast, createPeerConnection, updateRemotePeer, removeRemotePeer, drainQueue, onAppData]);
+  }, [broadcast, createPeerConnection, updateRemotePeer, removeRemotePeer, drainQueue, onAppData]);
 
   // ─── Public joinRoom action ───────────────────────────────────────────────
   const joinRoom = useCallback(async () => {
+    // Use the ref to get the latest roomCode — avoids stale closure issues
+    const currentRoomCode = roomCodeRef.current;
+    if (!currentRoomCode) return;
     setState(s => ({ ...s, status: 'joining', remotePeers: [], error: null }));
     const stream = await getMicrophone();
-    if (stream) initSignaling();
+    if (stream) initSignaling(currentRoomCode);
   }, [getMicrophone, initSignaling]);
 
   // ─── End call + cleanup ───────────────────────────────────────────────────

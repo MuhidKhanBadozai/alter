@@ -52,42 +52,43 @@ const HaramiBotEngine: React.FC<HaramiBotEngineProps> = ({
 
     const setup = async () => {
       try {
-        // First probe the stream to confirm it's alive and get the content-type
         const streamUrl = `${getStreamBase()}/api/stream?id=${encodeURIComponent(videoId)}`;
         
         audio!.crossOrigin = 'anonymous';
         audio!.preload = 'auto';
         audio!.src = streamUrl;
+        audio!.volume = isDeafened ? 0 : Math.min(1, Math.max(0, volume / 100));
 
-        const tryCapture = () => {
+        const tryPlay = () => {
           if (cancelled || !audio) return;
+          setIsSourceConnected(true);
           try {
             const capturedStream = (audio as any).captureStream?.() || (audio as any).mozCaptureStream?.();
-            if (!capturedStream) {
-              onError('Browser does not support audio.captureStream().');
-              return;
+            if (capturedStream) {
+              streamRef.current = capturedStream;
+              onStreamReady(capturedStream);
+            } else {
+              onStreamReady(new MediaStream());
             }
-            streamRef.current = capturedStream;
-            setIsSourceConnected(true);
-            onStreamReady(capturedStream);
-            audio!.play().catch(e => {
-              if (!cancelled) onError(`Playback blocked: ${e.message}`);
-            });
-          } catch (e: any) {
-            if (!cancelled) onError(`captureStream failed: ${e.message}`);
+          } catch {
+            onStreamReady(new MediaStream());
           }
+
+          audio!.play().catch(e => {
+            console.warn('[Harami] Autoplay prevented, waiting for interaction:', e.message);
+          });
         };
 
-        audio!.oncanplay = tryCapture;
-        audio!.oncanplaythrough = tryCapture;
+        audio!.oncanplay = tryPlay;
         audio!.onended = () => { if (!cancelled) onEnded(); };
         audio!.onerror = () => {
           if (!cancelled && audio!.error) {
-            onError(`Audio stream error: ${audio!.error.message}`);
+            onError(`Audio stream error: ${audio!.error.message || 'Stream interrupted'}`);
           }
         };
 
         audio!.load();
+        audio!.play().catch(() => {});
       } catch (e: any) {
         if (!cancelled) onError(`Setup failed: ${e.message}`);
       }

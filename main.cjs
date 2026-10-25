@@ -2,16 +2,15 @@ const { app, BrowserWindow, shell, desktopCapturer, session, ipcMain } = require
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const ytSearch = require('yt-search');
-const ytdlBase = require('youtube-dl-exec');
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const { spawn } = require('child_process');
 
 const isPackaged = __dirname.includes('app.asar');
 const binPath = isPackaged 
   ? path.join(__dirname.replace('app.asar', 'app.asar.unpacked'), 'node_modules', 'youtube-dl-exec', 'bin', 'yt-dlp.exe')
-  : undefined;
-const youtubedl = isPackaged ? ytdlBase.create(binPath) : ytdlBase;
+  : path.join(__dirname, 'node_modules', 'youtube-dl-exec', 'bin', 'yt-dlp.exe');
 
 const isDev = process.env.NODE_ENV === 'development';
 const startUrl = process.env.ELECTRON_START_URL || 'http://localhost:3000';
@@ -282,20 +281,30 @@ app.whenReady().then(() => {
       const videoId = reqUrl.searchParams.get('id');
       if (!videoId) { res.statusCode = 400; res.end(); return; }
       
-      youtubedl(`https://www.youtube.com/watch?v=${videoId}`, { dumpJson: true, noWarnings: true }).then(output => {
-        const format = output.formats.reverse().find(f => f.vcodec === 'none' && f.acodec !== 'none') || output.formats[0];
-        if (!format || !format.url) { res.statusCode = 500; res.end('No audio format'); return; }
-        
-        res.setHeader('Content-Type', format.ext === 'webm' ? 'audio/webm' : 'audio/mp4');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Cache-Control', 'no-cache');
-        
-        https.get(format.url, (proxyRes) => {
-          proxyRes.pipe(res);
-          proxyRes.on('error', err => { console.error('proxy stream error:', err.message); res.end(); });
-        }).on('error', err => { console.error('https get error:', err.message); res.end(); });
+      res.setHeader('Content-Type', 'audio/mp4');
+      res.setHeader('Transfer-Encoding', 'chunked');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+      res.setHeader('Cache-Control', 'no-cache');
 
-      }).catch(err => { res.statusCode = 500; res.end(JSON.stringify({ error: err.message })); });
+      const cp = spawn(binPath, [
+        `https://www.youtube.com/watch?v=${videoId}`,
+        '--extractor-args', 'youtube:player_client=android,web',
+        '-f', 'ba/b',
+        '-o', '-',
+        '--no-warnings'
+      ]);
+
+      cp.stdout.pipe(res);
+      cp.stderr.on('data', () => {});
+      cp.on('error', (err) => {
+        console.error('[Electron Stream Error]:', err.message);
+        if (!res.headersSent) { res.statusCode = 500; res.end(JSON.stringify({ error: err.message })); }
+      });
+
+      req.on('close', () => {
+        try { cp.kill(); } catch {}
+      });
     } else if (reqUrl.pathname === '/api/search') {
       const query = reqUrl.searchParams.get('q');
       if (!query) { res.statusCode = 400; res.end(); return; }

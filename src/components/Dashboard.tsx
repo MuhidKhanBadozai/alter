@@ -123,7 +123,7 @@ export default function Dashboard({ user, audioSettings, onOpenSettings }: Dashb
   const isMuted = rtc.isMuted;
   const callPhase = rtc.status === 'idle' || rtc.status === 'ended'
     ? CallPhase.IDLE
-    : rtc.status === 'connected'
+    : (rtc.status === 'connected' || rtc.remotePeers.length > 0 || (isInCall && !!rtc.localAudioStream))
       ? CallPhase.CONNECTED
       : CallPhase.CONNECTING_SIGNALING;
 
@@ -305,10 +305,10 @@ export default function Dashboard({ user, audioSettings, onOpenSettings }: Dashb
 
   // Toggle user mute state
   const handleToggleMute = () => {
+    const willBeMuted = !rtc.isMuted;
     rtc.toggleMute();
-    const newMuteState = !rtc.isMuted; // Use inverted current state since toggle happens synchronously
-    addLog(`Toggled microphone`, "warning");
-    rtc.broadcastAppData('app_data', JSON.stringify({ type: 'mute_status', isMuted: newMuteState }));
+    addLog(`Microphone ${willBeMuted ? "muted" : "unmuted"}`, willBeMuted ? "warning" : "info");
+    rtc.broadcastAppData('app_data', JSON.stringify({ type: 'mute_status', isMuted: willBeMuted }));
   };
 
   // Toggle user deafen state
@@ -319,6 +319,11 @@ export default function Dashboard({ user, audioSettings, onOpenSettings }: Dashb
 
   const searchYouTube = async (query: string) => {
     try {
+      const urlMatch = query.match(/(?:youtube\.com\/(?:watch\?.*v=|embed\/|v\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+      if (urlMatch && urlMatch[1]) {
+        return urlMatch[1];
+      }
+
       if ((window as any).electronAPI) {
         return await (window as any).electronAPI.searchYoutube(query);
       } else {
@@ -355,7 +360,7 @@ export default function Dashboard({ user, audioSettings, onOpenSettings }: Dashb
 
     const text = appDataMessage.trim();
     const isBotSummon = text.toLowerCase() === '@harami';
-    const isBotPlay = text.toLowerCase().startsWith('/play ');
+    const isBotPlay = text.toLowerCase().startsWith('/play');
     const isBotStop = text.toLowerCase() === '/stop';
 
     if (isBotSummon) {
@@ -377,7 +382,11 @@ export default function Dashboard({ user, audioSettings, onOpenSettings }: Dashb
     setAppDataMessage("");
 
     if (isBotPlay) {
-      const query = text.slice(6).trim();
+      const query = text.replace(/^\/play\s*/i, '').replace(/^{|}$/g, '').trim();
+      if (!query) {
+        addLog("Please specify a song name or YouTube link: /play <song>", "warning");
+        return;
+      }
       haramiQueryRef.current = query; // remember for auto-recommendations
       addLog(`Harami searching for: ${query}...`, "info");
       const videoId = await searchYouTube(query);
@@ -396,6 +405,7 @@ export default function Dashboard({ user, audioSettings, onOpenSettings }: Dashb
       rtc.broadcastAppData('app_data', JSON.stringify({ type: 'harami_stop' }));
       setIsHaramiActive(false);
       setHaramiVideoId(null);
+      setHaramiStatus('');
       addLog(`Harami stopped.`, "warning");
     }
   };
@@ -477,6 +487,13 @@ export default function Dashboard({ user, audioSettings, onOpenSettings }: Dashb
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rtc.remotePeers.length]);
+
+  // Log RTC errors if any
+  useEffect(() => {
+    if (rtc.error) {
+      addLog(`⚠ ${rtc.error}`, "error");
+    }
+  }, [rtc.error]);
 
   // Add a peer simulation inside room
   const handleSimulateNewPeer = () => {
@@ -1061,7 +1078,7 @@ export default function Dashboard({ user, audioSettings, onOpenSettings }: Dashb
                     <div className="flex items-center gap-2 bg-zinc-950 border border-[#28282C] px-2.5 py-1 rounded">
                       <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
                       <span className="text-[11px] font-mono font-bold text-zinc-300">
-                        {callPhase === CallPhase.CONNECTED ? formatTime(callDuration) : "SIGNALING..."}
+                        {rtc.remotePeers.length > 0 ? formatTime(callDuration) : "WAITING FOR PEERS..."}
                       </span>
                     </div>
                   </div>
@@ -1088,6 +1105,34 @@ export default function Dashboard({ user, audioSettings, onOpenSettings }: Dashb
                   ) : (
                     /* Active Voice/Video Streams list */
                     <div className="space-y-4">
+                      {/* Waiting banner when alone in room */}
+                      {rtc.remotePeers.length === 0 && (
+                        <div className="p-4 rounded-xl border border-blue-900/40 bg-blue-950/20 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-lg">
+                          <div className="flex items-center gap-3">
+                            <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping shrink-0" />
+                            <div>
+                              <p className="text-xs font-semibold text-zinc-100 flex items-center gap-2">
+                                <span>Channel Live</span>
+                                <span className="text-[9px] bg-emerald-950/60 text-emerald-400 border border-emerald-800/40 px-1.5 py-0.5 rounded font-mono uppercase">READY</span>
+                              </p>
+                              <p className="text-[11px] font-mono text-zinc-400 mt-0.5">
+                                Room Code: <span className="text-blue-400 font-bold select-all">{callCode}</span>
+                              </p>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard.writeText(callCode);
+                              addLog(`Copied room code [${callCode}] to clipboard`, "info");
+                            }}
+                            className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-mono font-semibold transition-colors cursor-pointer shrink-0 shadow-md flex items-center gap-1.5"
+                          >
+                            <Share2 className="w-3.5 h-3.5" />
+                            <span>Copy Code</span>
+                          </button>
+                        </div>
+                      )}
                       {/* Screenshare theater if active */}
                       {screenSharerId ? (
                         <div className="shrink-0">

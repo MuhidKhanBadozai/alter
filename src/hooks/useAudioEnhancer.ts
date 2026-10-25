@@ -66,6 +66,8 @@ export function useAudioEnhancer(
   const localAnalyserRef = useRef<AnalyserNode | null>(null);
   const localSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const [volumes, setVolumes] = useState<Record<string, number>>({});
+  const isMutedRef = useRef(isMuted);
+  isMutedRef.current = isMuted;
 
   // Ensure AudioContext is ready and active
   const getAudioContext = useCallback((): AudioContext => {
@@ -96,7 +98,7 @@ export function useAudioEnhancer(
 
   // ─── LOCAL MICROPHONE ANALYSER (for local user speaking ring) ────────────
   useEffect(() => {
-    if (!localStream || isMuted || localStream.getAudioTracks().length === 0) {
+    if (!localStream || localStream.getAudioTracks().length === 0) {
       if (localSourceRef.current) {
         try { localSourceRef.current.disconnect(); } catch { /* ignore */ }
         localSourceRef.current = null;
@@ -107,15 +109,16 @@ export function useAudioEnhancer(
 
     const ctx = getAudioContext();
     try {
-      const source = ctx.createMediaStreamSource(localStream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.4;
-      source.connect(analyser);
-      // NOTE: Do not connect local mic to ctx.destination (avoids self-feedback loop!)
+      if (!localSourceRef.current) {
+        const source = ctx.createMediaStreamSource(localStream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.4;
+        source.connect(analyser);
 
-      localSourceRef.current = source;
-      localAnalyserRef.current = analyser;
+        localSourceRef.current = source;
+        localAnalyserRef.current = analyser;
+      }
     } catch (err) {
       console.warn('[AudioEnhancer] Local analyser setup failed:', err);
     }
@@ -127,7 +130,7 @@ export function useAudioEnhancer(
       }
       localAnalyserRef.current = null;
     };
-  }, [localStream, isMuted, getAudioContext]);
+  }, [localStream, getAudioContext]);
 
   // ─── REMOTE PEERS DSP CHAIN & ENHANCEMENT ─────────────────────────────────
   useEffect(() => {
@@ -272,7 +275,7 @@ export function useAudioEnhancer(
         const next = { ...prev };
 
         // 1. Process Local Mic
-        if (localAnalyserRef.current) {
+        if (localAnalyserRef.current && !isMutedRef.current) {
           localAnalyserRef.current.getByteFrequencyData(dataArray);
           let sum = 0;
           for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];

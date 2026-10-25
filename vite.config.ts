@@ -3,8 +3,9 @@ import react from '@vitejs/plugin-react';
 import path from 'path';
 import {defineConfig} from 'vite';
 import ytSearch from 'yt-search';
-import youtubedl from 'youtube-dl-exec';
-import https from 'https';
+import { spawn } from 'child_process';
+
+const ytDlpPath = path.resolve(__dirname, 'node_modules/youtube-dl-exec/bin/yt-dlp.exe');
 
 export default defineConfig(() => {
   return {
@@ -24,6 +25,7 @@ export default defineConfig(() => {
                 const r = await ytSearch(query);
                 const videoId = r.videos[0]?.videoId || null;
                 res.setHeader('Content-Type', 'application/json');
+                res.setHeader('Access-Control-Allow-Origin', '*');
                 res.end(JSON.stringify({ videoId }));
                 return;
               }
@@ -41,33 +43,32 @@ export default defineConfig(() => {
               const videoId = url.searchParams.get('id');
               if (!videoId) { next(); return; }
 
-              // Use youtube-dl-exec to get the deciphered direct URL
-              const output: any = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, { dumpJson: true, noWarnings: true });
-              
-              // Find the best audio-only format (usually m4a or webm)
-              const format = output.formats.reverse().find((f: any) => f.vcodec === 'none' && f.acodec !== 'none') || output.formats[0];
-              if (!format || !format.url) {
-                res.statusCode = 500;
-                res.end(JSON.stringify({ error: 'No audio format found' }));
-                return;
-              }
-
-              res.setHeader('Content-Type', format.ext === 'webm' ? 'audio/webm' : 'audio/mp4');
+              res.setHeader('Content-Type', 'audio/mp4');
               res.setHeader('Transfer-Encoding', 'chunked');
               res.setHeader('Access-Control-Allow-Origin', '*');
+              res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
               res.setHeader('Cache-Control', 'no-cache');
 
-              // Proxy the audio stream
-              https.get(format.url, (proxyRes) => {
-                proxyRes.pipe(res);
-                proxyRes.on('error', (err) => {
-                  console.error('Proxy stream error:', err.message);
-                  if (!res.headersSent) { res.statusCode = 500; res.end(); }
-                  else { res.end(); }
-                });
-              }).on('error', (err) => {
-                console.error('HTTPS get error:', err.message);
-                if (!res.headersSent) { res.statusCode = 500; res.end(); }
+              const cp = spawn(ytDlpPath, [
+                `https://www.youtube.com/watch?v=${videoId}`,
+                '--extractor-args', 'youtube:player_client=android,web',
+                '-f', 'ba/b',
+                '-o', '-',
+                '--no-warnings'
+              ]);
+
+              cp.stdout.pipe(res);
+              cp.stderr.on('data', () => {});
+              cp.on('error', (err) => {
+                console.error('[Harami stream error]:', err.message);
+                if (!res.headersSent) {
+                  res.statusCode = 500;
+                  res.end(JSON.stringify({ error: err.message }));
+                }
+              });
+
+              req.on('close', () => {
+                try { cp.kill(); } catch {}
               });
 
             } catch (e: any) {
